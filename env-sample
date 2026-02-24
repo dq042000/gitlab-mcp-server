@@ -1,0 +1,10 @@
+# GitLab 設定
+GITLAB_API=https://<gitlab-domain>/api/v4
+GITLAB_GROUP_TOKEN=
+PLATFORM_GROUP_ID=
+
+# 伺服器設定 (選填)
+PORT=1688
+
+# URL
+URL=http://
