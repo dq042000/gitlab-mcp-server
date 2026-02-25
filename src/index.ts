@@ -349,7 +349,7 @@ function createMcpServer() {
 
       try {
         // 如果沒有指定 ref，先取得預設分支
-        let branch = ref;
+        let branch: string = ref || "";
         if (!branch) {
           const projectUrl = `${GITLAB_API}/projects/${encodedProjectId}`;
           const projectResponse = await axios.get(projectUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
@@ -557,7 +557,7 @@ function createMcpServer() {
             const relevantLines: Array<{ lineNum: number; content: string }> = [];
             for (let i = 0; i < lines.length; i++) {
               const line = lines[i];
-              if (autoKeywords.some(kw => line.toLowerCase().includes(kw.toLowerCase()))) {
+              if (line && autoKeywords.some(kw => line.toLowerCase().includes(kw.toLowerCase()))) {
                 relevantLines.push({ lineNum: i + 1, content: line });
               }
             }
