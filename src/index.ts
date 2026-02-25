@@ -139,7 +139,7 @@ function createMcpServer() {
     }
 
     // 優先嘗試常見的預設分支
-    const priorityBranches = ["main", "master", "develop", "development"];
+    const priorityBranches = ["main", "master", "develop", "production"];
     const sortedBranches = [
       ...priorityBranches.filter(b => allBranches.includes(b)),
       ...allBranches.filter(b => !priorityBranches.includes(b))
