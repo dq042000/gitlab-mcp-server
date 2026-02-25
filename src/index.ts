@@ -617,6 +617,33 @@ app.use(express.json());
 
 // ── Streamable HTTP Transport（新版協議，供現代 MCP 客戶端使用）───────────────
 const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
+const sessionLastActivity = new Map<string, number>();
+
+// 定期輸出當前活躍的 session 數量（每 30 秒）
+setInterval(() => {
+  console.log(`[${new Date().toLocaleTimeString()}] 📊 當前活躍 session 數量: ${streamableTransports.size}`);
+  if (streamableTransports.size > 0) {
+    const sessionIds = Array.from(streamableTransports.keys());
+    console.log(`   Session IDs: ${sessionIds.join(', ')}`);
+  }
+}, 30000);
+
+// 定期清理超過 30 分鐘未活動的 session
+setInterval(() => {
+  const now = Date.now();
+  const timeout = 30 * 60 * 1000; // 30 分鐘
+  
+  for (const [sessionId, lastActivity] of sessionLastActivity.entries()) {
+    if (now - lastActivity > timeout) {
+      const transport = streamableTransports.get(sessionId);
+      if (transport) {
+        console.log(`[${new Date().toLocaleTimeString()}] ⏰ Session ${sessionId} 超時，自動清理`);
+        streamableTransports.delete(sessionId);
+        sessionLastActivity.delete(sessionId);
+      }
+    }
+  }
+}, 5 * 60 * 1000); // 每 5 分鐘檢查一次
 
 app.post("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -625,6 +652,7 @@ app.post("/mcp", async (req, res) => {
   if (transport) {
     // 已存在的 session：直接轉發請求
     console.log(`[${new Date().toLocaleTimeString()}] [Streamable] 既有 session: ${sessionId}`);
+    if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
     await transport.handleRequest(req, res, req.body);
     return;
   }
@@ -639,6 +667,7 @@ app.post("/mcp", async (req, res) => {
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sid) => {
       streamableTransports.set(sid, transport!);
+      sessionLastActivity.set(sid, Date.now()); // 記錄建立時間
       console.log(`[${new Date().toLocaleTimeString()}] ✅ [Streamable] session 建立: ${sid}`);
     },
   });
@@ -646,6 +675,7 @@ app.post("/mcp", async (req, res) => {
   transport.onclose = () => {
     if (transport!.sessionId) {
       streamableTransports.delete(transport!.sessionId);
+      sessionLastActivity.delete(transport!.sessionId); // 清理活動記錄
       console.log(`[${new Date().toLocaleTimeString()}] 🔌 [Streamable] session 關閉: ${transport!.sessionId}`);
     }
   };
@@ -663,6 +693,7 @@ app.get("/mcp", async (req, res) => {
     res.status(404).send("Session not found");
     return;
   }
+  if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
   await transport.handleRequest(req, res);
 });
 
@@ -677,6 +708,7 @@ app.delete("/mcp", async (req, res) => {
 
   // 驗證是否成功移除
   if (sessionId) {
+    sessionLastActivity.delete(sessionId); // 清理活動記錄
     if (!streamableTransports.has(sessionId)) {
       console.log(`✅ Session ${sessionId} 已成功移除`);
     } else {
