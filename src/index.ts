@@ -74,6 +74,144 @@ function createMcpServer() {
     }
   });
 
+  server.tool("search_projects_by_file", "搜尋包含特定檔案的專案", {
+    filePath: z.string().describe("要搜尋的檔案路徑，例如：web/api/config/autoload/pay.local.php.dist"),
+    maxProjects: z.number().optional().describe("最多檢查的專案數量（預設 50，避免超時）"),
+  }, async ({ filePath, maxProjects = 50 }) => {
+    console.log(`[search_projects_by_file] 搜尋包含檔案 "${filePath}" 的專案（最多檢查 ${maxProjects} 個）`);
+    
+    try {
+      // 先取得專案列表
+      const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects?include_subgroups=true&per_page=100&order_by=last_activity_at`;
+      const projectsResponse = await axios.get(projectsUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
+      const allProjects = Array.isArray(projectsResponse.data) ? projectsResponse.data : [];
+      
+      console.log(`[search_projects_by_file] 找到 ${allProjects.length} 個專案，將檢查前 ${Math.min(maxProjects, allProjects.length)} 個`);
+      
+      const matchedProjects: Array<{ id: number; name: string; path: string; branch: string }> = [];
+      const projectsToCheck = allProjects.slice(0, maxProjects);
+      
+      // 逐一檢查專案
+      for (const project of projectsToCheck) {
+        const encodedProjectId = encodeURIComponent(project.id);
+        const encodedFilePath = encodeURIComponent(filePath);
+        
+        try {
+          // 先嘗試預設分支
+          const defaultBranch = project.default_branch || "main";
+          const fileUrl = `${GITLAB_API}/projects/${encodedProjectId}/repository/files/${encodedFilePath}?ref=${encodeURIComponent(defaultBranch)}`;
+          
+          await axios.head(fileUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
+          matchedProjects.push({
+            id: project.id,
+            name: project.name,
+            path: project.path_with_namespace,
+            branch: defaultBranch,
+          });
+          console.log(`[search_projects_by_file] ✓ 找到：${project.path_with_namespace} (${defaultBranch})`);
+        } catch (error: any) {
+          // 檔案不存在於預設分支，繼續下一個專案
+          if (error.response?.status === 404) {
+            continue;
+          }
+        }
+      }
+      
+      console.log(`[search_projects_by_file] 完成！找到 ${matchedProjects.length} 個包含該檔案的專案`);
+      
+      if (matchedProjects.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `未找到包含檔案 "${filePath}" 的專案（已檢查 ${projectsToCheck.length} 個專案）\n\n建議：\n1. 確認檔案路徑是否正確\n2. 檔案可能位於非預設分支\n3. 使用 search_code 工具搜尋相關程式碼`,
+          }],
+        };
+      }
+      
+      return {
+        content: [{
+          type: "text",
+          text: `找到 ${matchedProjects.length} 個包含檔案 "${filePath}" 的專案：\n\n${matchedProjects.map(p => `- **${p.name}** (ID: ${p.id})\n  路徑: ${p.path}\n  分支: ${p.branch}`).join("\n\n")}`,
+        }],
+      };
+    } catch (error: any) {
+      console.error(`[search_projects_by_file] 失敗`, { message: error.message });
+      return {
+        content: [{
+          type: "text",
+          text: `搜尋失敗: ${error.message}`,
+        }],
+        isError: true,
+      };
+    }
+  });
+
+  server.tool("search_code", "在群組內搜尋程式碼或檔案內容", {
+    query: z.string().describe("搜尋關鍵字，例如：臺銀、esunbank、pay.local.php.dist"),
+    scope: z.enum(["blobs", "wiki_blobs"]).optional().describe("搜尋範圍（預設 blobs = 程式碼檔案）"),
+  }, async ({ query, scope = "blobs" }) => {
+    console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}）`);
+    
+    try {
+      const searchUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search?scope=${scope}&search=${encodeURIComponent(query)}&per_page=50`;
+      const response = await axios.get(searchUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
+      const results = Array.isArray(response.data) ? response.data : [];
+      
+      console.log(`[search_code] 找到 ${results.length} 筆結果`);
+      
+      if (results.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `未找到包含 "${query}" 的程式碼\n\n建議：\n1. 嘗試使用不同的關鍵字\n2. 使用 search_projects_by_file 搜尋特定檔案\n3. 確認關鍵字拼寫是否正確`,
+          }],
+        };
+      }
+      
+      // 將結果依專案分組
+      const groupedResults = new Map<string, Array<any>>();
+      for (const result of results) {
+        const projectName = result.project_id ? `Project ${result.project_id}` : "Unknown";
+        if (!groupedResults.has(projectName)) {
+          groupedResults.set(projectName, []);
+        }
+        groupedResults.get(projectName)!.push(result);
+      }
+      
+      let output = `找到 ${results.length} 筆包含 "${query}" 的程式碼：\n\n`;
+      
+      for (const [projectName, items] of groupedResults.entries()) {
+        output += `## ${projectName} (${items.length} 筆)\n\n`;
+        for (const item of items.slice(0, 10)) { // 每個專案最多顯示 10 筆
+          output += `- **${item.filename || item.path || "unknown"}**\n`;
+          if (item.ref) output += `  分支: ${item.ref}\n`;
+          if (item.data) {
+            const preview = item.data.substring(0, 200).replace(/\n/g, " ");
+            output += `  內容預覽: ${preview}${item.data.length > 200 ? "..." : ""}\n`;
+          }
+          output += "\n";
+        }
+        if (items.length > 10) {
+          output += `  ... 還有 ${items.length - 10} 筆結果\n\n`;
+        }
+      }
+      
+      return {
+        content: [{ type: "text", text: output }],
+      };
+    } catch (error: any) {
+      const status = error.response?.status;
+      console.error(`[search_code] 失敗`, { status, message: error.message });
+      return {
+        content: [{
+          type: "text",
+          text: `搜尋失敗: ${error.message}${status === 403 ? "\n\n可能是權限不足或 Token 沒有搜尋權限" : ""}`,
+        }],
+        isError: true,
+      };
+    }
+  });
+
   server.tool("read_project_file", "讀取 GitLab 專案檔案（自動搜尋所有分支）", {
     projectId: z.string().describe("GitLab Project ID"),
     filePath: z.string().describe("檔案完整路徑"),
