@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "start:bg": "nohup node dist/index.js > server.log 2>&1 & echo $! > .pid",
+    "stop": "kill $(cat .pid) && rm .pid"
   },
   "keywords": [],
   "author": "",
