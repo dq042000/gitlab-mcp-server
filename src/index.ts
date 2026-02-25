@@ -611,7 +611,7 @@ function createMcpServer() {
   return server;
 }
 
-// --- Express 邏輯 ---
+// --- Express 初始化 ---
 const app = express();
 app.use(express.json());
 
@@ -674,6 +674,15 @@ app.delete("/mcp", async (req, res) => {
     return;
   }
   await transport.handleRequest(req, res);
+
+  // 驗證是否成功移除
+  if (sessionId) {
+    if (!streamableTransports.has(sessionId)) {
+      console.log(`✅ Session ${sessionId} 已成功移除`);
+    } else {
+      console.log(`❌ Session ${sessionId} 未成功移除`);
+    }
+  }
 });
 
 
