@@ -81,39 +81,61 @@ function createMcpServer() {
   }, async ({ projectId, filePath, ref }) => {
     // projectId 可能為 "group/project" 路徑，需整體 URL 編碼
     const encodedProjectId = encodeURIComponent(projectId);
-    // filePath 使用雙重編碼確保 GitLab API 正確解析
-    const encodedFilePath = encodeURIComponent(filePath);
+    // filePath 使用雙重編碼確保 GitLab API 正確解析（API 路由會先解碼一次）
+    const encodedFilePath = encodeURIComponent(encodeURIComponent(filePath));
+
+    console.log(`[read_project_file] 開始讀取`, { projectId, encodedProjectId, filePath, encodedFilePath, ref });
+
+    // 先嘗試取得專案的預設分支
+    let defaultBranch: string | null = null;
+    try {
+      const projectInfoUrl = `${GITLAB_API}/projects/${encodedProjectId}`;
+      console.log(`[read_project_file] 取得專案資訊: ${projectInfoUrl}`);
+      const projectInfo = await axios.get(projectInfoUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
+      defaultBranch = projectInfo.data?.default_branch || null;
+      console.log(`[read_project_file] 專案預設分支: ${defaultBranch}`);
+    } catch (error: any) {
+      console.warn(`[read_project_file] 無法取得專案資訊`, { status: error.response?.status, message: error.message });
+    }
 
     const tryFetch = async (branch: string) => {
       const url = `${GITLAB_API}/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(branch)}`;
-      console.log(`[read_project_file] GET ${url}`);
+      console.log(`[read_project_file] 嘗試分支 "${branch}": ${url}`);
       return axios.get(url, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
     };
 
-    // 依序嘗試：指定 ref → main → master → production
+    // 依序嘗試：指定 ref → 專案預設分支 → main → master → production
     const fallbackBranches = ["main", "master", "production"];
-    const tryOrder = [ref, ...fallbackBranches.filter((b) => b !== ref)];
+    let tryOrder = [ref];
+    if (defaultBranch && defaultBranch !== ref) {
+      tryOrder.push(defaultBranch);
+    }
+    tryOrder = [...tryOrder, ...fallbackBranches.filter((b) => !tryOrder.includes(b))];
+    
+    console.log(`[read_project_file] 嘗試順序: ${tryOrder.join(" → ")}`);
 
     for (const branch of tryOrder) {
       try {
         const response = await tryFetch(branch);
         if (branch !== ref) {
-          console.warn(`[read_project_file] 使用 fallback branch "${branch}" 成功`);
+          console.warn(`[read_project_file] ✓ 使用 fallback branch "${branch}" 成功`);
+        } else {
+          console.log(`[read_project_file] ✓ 使用指定 branch "${branch}" 成功`);
         }
         return { content: [{ type: "text", text: String(response.data) }] };
       } catch (error: any) {
         const status = error.response?.status;
+        const body = error.response?.data;
         if (status === 404) {
-          console.warn(`[read_project_file] branch "${branch}" 404，嘗試下一個`);
+          console.warn(`[read_project_file] ✗ branch "${branch}" 404，嘗試下一個`);
           continue;
         }
         // 非 404 錯誤直接回傳
-        const body = error.response?.data;
-        console.error(`[read_project_file] failed`, { status, body, projectId, filePath, branch });
+        console.error(`[read_project_file] 非預期錯誤`, { status, body, projectId, filePath, branch, message: error.message });
         return {
           content: [{
             type: "text",
-            text: `讀取失敗：projectId=${projectId}, filePath=${filePath}, ref=${branch}\n${status ? `status: ${status}\n` : ""}${body ? `response: ${JSON.stringify(body)}` : error.message}`,
+            text: `讀取失敗：projectId=${projectId}, filePath=${filePath}, ref=${branch}\n${status ? `HTTP ${status}\n` : ""}${body ? `回應: ${JSON.stringify(body)}\n` : ""}錯誤: ${error.message}`,
           }],
           isError: true,
         };
@@ -121,11 +143,11 @@ function createMcpServer() {
     }
 
     // 所有 branch 皆 404
-    console.error(`[read_project_file] 所有 branch 皆 404`, { projectId, filePath, tryOrder });
+    console.error(`[read_project_file] ❌ 所有分支皆 404`, { projectId, filePath, tryOrder });
     return {
       content: [{
         type: "text",
-        text: `讀取失敗：projectId=${projectId}, filePath=${filePath}\n所有分支（${tryOrder.join(", ")}）皆回傳 404，請確認 projectId 與 filePath 是否正確。`,
+        text: `讀取失敗：projectId=${projectId}, filePath=${filePath}\n\n所有分支（${tryOrder.join(", ")}）皆回傳 404。\n\n可能原因：\n1. 檔案路徑不正確（請確認大小寫與完整路徑）\n2. projectId 格式錯誤（可嘗試使用數字 ID）\n3. 檔案不存在於任何分支\n4. Token 權限不足`,
       }],
       isError: true,
     };
