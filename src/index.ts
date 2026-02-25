@@ -81,8 +81,8 @@ function createMcpServer() {
   }, async ({ projectId, filePath, ref }) => {
     // projectId 可能為 "group/project" 路徑，需整體 URL 編碼
     const encodedProjectId = encodeURIComponent(projectId);
-    // filePath 使用雙重編碼確保 GitLab API 正確解析（API 路由會先解碼一次）
-    const encodedFilePath = encodeURIComponent(encodeURIComponent(filePath));
+    // filePath 只需單次編碼（GitLab API 會自動處理路徑中的斜線）
+    const encodedFilePath = encodeURIComponent(filePath);
 
     console.log(`[read_project_file] 開始讀取`, { projectId, encodedProjectId, filePath, encodedFilePath, ref: ref || "未指定（搜尋所有分支）" });
 
