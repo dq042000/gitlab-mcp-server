@@ -6,10 +6,10 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "start:bg": "pm2 start dist/index.js --name copilot-bot",
-    "start:stop": "pm2 stop copilot-bot",
-    "start:restart": "pm2 restart copilot-bot",
-    "start:logs": "pm2 logs copilot-bot"
+    "start:bg": "pm2 start dist/index.js --name gitlab-mcp-server",
+    "start:stop": "pm2 stop gitlab-mcp-server",
+    "start:restart": "pm2 restart gitlab-mcp-server",
+    "start:logs": "pm2 logs gitlab-mcp-server"
   },
   "keywords": [],
   "author": "",
