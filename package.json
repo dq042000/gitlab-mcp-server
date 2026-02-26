@@ -6,8 +6,10 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "start:bg": "nohup node dist/index.js > server.log 2>&1 & echo $! > .pid",
-    "stop": "kill $(cat .pid) && rm .pid"
+    "start:bg": "pm2 start dist/index.js --name copilot-bot",
+    "start:stop": "pm2 stop copilot-bot",
+    "start:restart": "pm2 restart copilot-bot",
+    "start:logs": "pm2 logs copilot-bot"
   },
   "keywords": [],
   "author": "",
