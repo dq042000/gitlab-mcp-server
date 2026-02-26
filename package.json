@@ -9,7 +9,8 @@
     "start:bg": "pm2 start dist/index.js --name gitlab-mcp-server",
     "start:stop": "pm2 stop gitlab-mcp-server",
     "start:restart": "pm2 restart gitlab-mcp-server",
-    "start:logs": "pm2 logs gitlab-mcp-server"
+    "start:logs": "pm2 logs gitlab-mcp-server",
+    "start:remove": "pm2 delete gitlab-mcp-server"
   },
   "keywords": [],
   "author": "",
