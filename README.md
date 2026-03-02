@@ -67,6 +67,30 @@ MCP 連線模式與常見錯誤
 	- `maxResults`：最多回傳結果數
 - 多關鍵字請用 `|` 分隔，例如：`臺銀|台銀|繳費|virtual_account|bank_code`
 
+GitLab Token 權限建議（`GITLAB_GROUP_TOKEN`）
+
+- **建議類型**：`Group Access Token`
+- **最小 Scope**：`read_api`
+- **建議角色**：至少 `Reporter`（可讀取群組內專案與 repository 內容）
+- **不需要開啟**：`write_repository`、`read_registry`、`write_registry`
+
+說明：本專案目前僅使用 GitLab 讀取型 API（`GET/HEAD`），包含：
+
+- 列出群組專案
+- 搜尋程式碼
+- 讀取檔案內容
+- 讀取分支與目錄樹
+
+因此以 `read_api` 為最小且安全的預設即可；若你的 GitLab 環境策略較嚴格導致 `403`，再視需要升級為 `api`。
+
+Token 安全檢查清單
+
+- 不要把 token 寫進版本控制（避免提交 `.env`）
+- 使用部署環境變數或 Secret 管理服務保存 token
+- 以最小權限原則設定 scope（優先 `read_api`）
+- 設定到期日並定期輪替 token
+- 若懷疑外洩，立即 `revoke` 與重發 token
+
 相依與建議工具
 
 - Node.js (v16+ 建議)
