@@ -20,6 +20,13 @@ if (!GITLAB_API || !GROUP_TOKEN || !PLATFORM_GROUP_ID || !URL) {
   process.exit(1);
 }
 
+type CachedTreeEntry = {
+  expiresAt: number;
+  items: Array<any>;
+};
+
+const projectTreeCache = new Map<string, CachedTreeEntry>();
+
 // --- 每次連線建立一個新的 McpServer 實例，避免 "Already connected to a transport" 錯誤 ---
 function createMcpServer() {
   const server = new McpServer({
@@ -27,26 +34,244 @@ function createMcpServer() {
     version: "1.0.0",
   });
 
-  const searchCodeInGroup = async (query: string, scope: "blobs" | "wiki_blobs", perPage: number) => {
+  const splitKeywords = (rawQuery: string) => {
+    return Array.from(new Set(
+      rawQuery
+        .split(/[|\n,]+/)
+        .map(item => item.trim())
+        .filter(item => item.length > 0)
+    ));
+  };
+
+  const buildPreviewSnippet = (content: string, keyword: string) => {
+    const index = content.toLowerCase().indexOf(keyword.toLowerCase());
+    if (index < 0) {
+      return content.slice(0, 220).replace(/\n/g, " ");
+    }
+    const start = Math.max(0, index - 100);
+    const end = Math.min(content.length, index + 120);
+    return content.slice(start, end).replace(/\n/g, " ");
+  };
+
+  const uniqueResults = (results: Array<any>) => {
+    const seen = new Set<string>();
+    const deduped: Array<any> = [];
+
+    for (const item of results) {
+      const key = `${item?.project_id || ""}::${item?.path || item?.filename || ""}::${item?.ref || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(item);
+    }
+
+    return deduped;
+  };
+
+  const manualScanSearchInGroup = async (
+    keywords: string[],
+    options?: {
+      scanMode?: "fast" | "balanced" | "deep";
+      maxProjects?: number;
+      maxFilesReadPerProject?: number;
+      maxMatchedResults?: number;
+    }
+  ) => {
+    const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+    const scanMode = options?.scanMode || "balanced";
+
+    const modeDefaults = {
+      fast: { maxProjects: 15, maxFilesReadPerProject: 20, maxTreeItemsPerProject: 500, maxMatchedResults: 60, readConcurrency: 4, treeCacheTtlMs: 3 * 60 * 1000 },
+      balanced: { maxProjects: 35, maxFilesReadPerProject: 40, maxTreeItemsPerProject: 1200, maxMatchedResults: 120, readConcurrency: 6, treeCacheTtlMs: 8 * 60 * 1000 },
+      deep: { maxProjects: 80, maxFilesReadPerProject: 80, maxTreeItemsPerProject: 3000, maxMatchedResults: 250, readConcurrency: 8, treeCacheTtlMs: 15 * 60 * 1000 },
+    } as const;
+    const defaults = modeDefaults[scanMode];
+
+    const maxProjects = options?.maxProjects ?? defaults.maxProjects;
+    const maxFilesReadPerProject = options?.maxFilesReadPerProject ?? defaults.maxFilesReadPerProject;
+    const maxMatchedResults = options?.maxMatchedResults ?? defaults.maxMatchedResults;
+    const maxTreeItemsPerProject = defaults.maxTreeItemsPerProject;
+    const readConcurrency = defaults.readConcurrency;
+    const treeCacheTtlMs = defaults.treeCacheTtlMs;
+
+    const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects`;
+    const projectResponse = await axios.get(projectsUrl, {
+      headers,
+      params: {
+        include_subgroups: true,
+        per_page: 100,
+        order_by: "last_activity_at",
+        simple: true,
+      },
+    });
+
+    const projects = Array.isArray(projectResponse.data) ? projectResponse.data : [];
+    const projectsToScan = projects.slice(0, maxProjects);
+    const allowedExtensions = [
+      ".php", ".ts", ".js", ".vue", ".json", ".yml", ".yaml", ".xml",
+      ".sql", ".py", ".java", ".go", ".rb", ".ini", ".env", ".md", ".txt",
+    ];
+    const normalizedKeywords = keywords.map(keyword => keyword.toLowerCase());
+    const filenameHints = normalizedKeywords
+      .filter(keyword => /^[a-z0-9_\-\.]{2,}$/.test(keyword))
+      .slice(0, 8);
+
+    const matchedResults: Array<any> = [];
+
+    for (const project of projectsToScan) {
+      const projectId = project?.id;
+      if (!projectId) continue;
+
+      const defaultBranch = project.default_branch || "main";
+      const encodedProjectId = encodeURIComponent(String(projectId));
+
+      try {
+        const treeCacheKey = `${projectId}::${defaultBranch}`;
+        let treeItems: Array<any> = [];
+        const now = Date.now();
+        const cachedTree = projectTreeCache.get(treeCacheKey);
+
+        if (cachedTree && cachedTree.expiresAt > now) {
+          treeItems = cachedTree.items;
+        } else {
+          let page = 1;
+          while (treeItems.length < maxTreeItemsPerProject) {
+            const treeUrl = `${GITLAB_API}/projects/${encodedProjectId}/repository/tree`;
+            const treeResponse = await axios.get(treeUrl, {
+              headers,
+              params: {
+                ref: defaultBranch,
+                recursive: true,
+                per_page: 100,
+                page,
+              },
+            });
+
+            const pageData = Array.isArray(treeResponse.data) ? treeResponse.data : [];
+            if (pageData.length === 0) break;
+            treeItems.push(...pageData);
+
+            const nextPage = Number(treeResponse.headers["x-next-page"] || "0");
+            if (!nextPage) break;
+            page = nextPage;
+          }
+
+          projectTreeCache.set(treeCacheKey, {
+            expiresAt: now + treeCacheTtlMs,
+            items: treeItems,
+          });
+        }
+
+        const candidateFiles = treeItems
+          .filter(item => item?.type === "blob")
+          .filter(item => {
+            const path = String(item.path || "").toLowerCase();
+            return allowedExtensions.some(ext => path.endsWith(ext));
+          })
+          .sort((a, b) => {
+            const pathA = String(a?.path || "").toLowerCase();
+            const pathB = String(b?.path || "").toLowerCase();
+            const scoreA = filenameHints.some(hint => pathA.includes(hint)) ? 1 : 0;
+            const scoreB = filenameHints.some(hint => pathB.includes(hint)) ? 1 : 0;
+            return scoreB - scoreA;
+          })
+          .slice(0, maxFilesReadPerProject);
+
+        for (let index = 0; index < candidateFiles.length; index += readConcurrency) {
+          if (matchedResults.length >= maxMatchedResults) break;
+          const chunk = candidateFiles.slice(index, index + readConcurrency);
+
+          const chunkResults = await Promise.all(chunk.map(async (fileItem) => {
+            const filePath = String(fileItem.path || "");
+            const fileUrl = `${GITLAB_API}/projects/${encodedProjectId}/repository/files/${encodeURIComponent(filePath)}/raw`;
+
+            try {
+              const fileResponse = await axios.get(fileUrl, {
+                headers,
+                params: { ref: defaultBranch },
+              });
+
+              const content = String(fileResponse.data || "");
+              const loweredContent = content.toLowerCase();
+              const hitKeyword = normalizedKeywords.find(keyword => loweredContent.includes(keyword));
+
+              if (!hitKeyword) {
+                return null;
+              }
+
+              return {
+                project_id: projectId,
+                path: filePath,
+                filename: filePath.split("/").pop() || filePath,
+                ref: defaultBranch,
+                data: buildPreviewSnippet(content, hitKeyword),
+              };
+            } catch (fileError: any) {
+              const fileStatus = fileError.response?.status;
+              if (fileStatus !== 404) {
+                console.warn(`[manualScanSearchInGroup] 讀檔失敗`, {
+                  projectId,
+                  filePath,
+                  status: fileStatus,
+                  message: fileError.message,
+                });
+              }
+              return null;
+            }
+          }));
+
+          for (const item of chunkResults) {
+            if (!item) continue;
+            matchedResults.push(item);
+            if (matchedResults.length >= maxMatchedResults) break;
+          }
+        }
+      } catch (projectError: any) {
+        console.warn(`[manualScanSearchInGroup] 專案掃描失敗`, {
+          projectId,
+          status: projectError.response?.status,
+          message: projectError.message,
+        });
+      }
+
+      if (matchedResults.length >= maxMatchedResults) {
+        break;
+      }
+    }
+
+    return uniqueResults(matchedResults);
+  };
+
+  const searchCodeInGroup = async (
+    query: string,
+    scope: "blobs" | "wiki_blobs",
+    perPage: number,
+    options?: {
+      scanMode?: "fast" | "balanced" | "deep";
+      maxProjects?: number;
+      maxFilesReadPerProject?: number;
+      maxMatchedResults?: number;
+    }
+  ) => {
     const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
     const diagnostics: string[] = [];
+    const keywords = splitKeywords(query);
     const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [
       {
         name: "group-search-endpoint",
         url: `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search`,
-        params: { scope, search: query, per_page: perPage },
+        params: { scope, search: keywords[0] || query, per_page: perPage },
       },
       {
         name: "global-search-with-group-id",
         url: `${GITLAB_API}/search`,
-        params: { scope, search: query, group_id: String(PLATFORM_GROUP_ID), per_page: perPage },
+        params: { scope, search: keywords[0] || query, group_id: String(PLATFORM_GROUP_ID), per_page: perPage },
       },
     ];
 
     let lastError: any = null;
     for (const attempt of attempts) {
       try {
-        console.log(`[searchCodeInGroup] 嘗試策略: ${attempt.name}`, { query, scope, perPage });
+        console.log(`[searchCodeInGroup] 嘗試策略: ${attempt.name}`, { query, keywords, scope, perPage });
         const response = await axios.get(attempt.url, { headers, params: attempt.params });
         const results = Array.isArray(response.data) ? response.data : [];
         console.log(`[searchCodeInGroup] 策略成功: ${attempt.name}, 結果 ${results.length} 筆`);
@@ -71,60 +296,15 @@ function createMcpServer() {
     }
 
     try {
-      console.log(`[searchCodeInGroup] 進入 fallback：逐專案搜尋`, { query, scope });
-      const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects`;
-      const projectsResponse = await axios.get(projectsUrl, {
-        headers,
-        params: {
-          include_subgroups: true,
-          per_page: 100,
-          order_by: "last_activity_at",
-          simple: true,
-        },
-      });
-
-      const projects = Array.isArray(projectsResponse.data) ? projectsResponse.data : [];
-      const aggregatedResults: Array<any> = [];
-      const maxResults = 200;
-
-      for (const project of projects) {
-        const projectId = project?.id;
-        if (!projectId) continue;
-
-        try {
-          const projectSearchUrl = `${GITLAB_API}/projects/${encodeURIComponent(String(projectId))}/search`;
-          const projectSearchResponse = await axios.get(projectSearchUrl, {
-            headers,
-            params: {
-              scope,
-              search: query,
-              per_page: 20,
-            },
-          });
-
-          const projectResults = Array.isArray(projectSearchResponse.data) ? projectSearchResponse.data : [];
-          if (projectResults.length > 0) {
-            aggregatedResults.push(...projectResults);
-          }
-
-          if (aggregatedResults.length >= maxResults) {
-            break;
-          }
-        } catch (projectError: any) {
-          const projectStatus = projectError.response?.status;
-          const projectBody = projectError.response?.data;
-          console.warn(`[searchCodeInGroup] 專案 ${projectId} 搜尋失敗`, {
-            status: projectStatus,
-            body: projectBody,
-            message: projectError.message,
-          });
-        }
-      }
-
-      console.log(`[searchCodeInGroup] fallback 完成，結果 ${aggregatedResults.length} 筆`);
+      console.log(`[searchCodeInGroup] 進入 fallback：逐專案掃描內容`, { query, keywords, scope });
+      const scanResults = await manualScanSearchInGroup(
+        keywords.length > 0 ? keywords : [query],
+        options,
+      );
+      console.log(`[searchCodeInGroup] fallback 完成，結果 ${scanResults.length} 筆`);
       return {
-        results: aggregatedResults.slice(0, maxResults),
-        strategy: "project-by-project-fallback",
+        results: scanResults,
+        strategy: "manual-content-scan-fallback",
       };
     } catch (fallbackError: any) {
       const fallbackStatus = fallbackError.response?.status;
@@ -268,12 +448,65 @@ function createMcpServer() {
     {
       query: z.string().describe("搜尋關鍵字，例如：臺銀、esunbank、PaymentService、virtual_account"),
       scope: z.enum(["blobs", "wiki_blobs"]).optional().describe("搜尋範圍（預設 blobs = 程式碼檔案）"),
+      mode: z.enum(["fast", "balanced", "deep", "hybrid"]).optional().describe("掃描模式：fast（較快）、balanced（預設）、deep（較完整）、hybrid（先快後深）"),
+      maxProjects: z.number().int().min(1).max(200).optional().describe("最多掃描專案數（覆蓋模式預設值）"),
+      maxFilesPerProject: z.number().int().min(1).max(200).optional().describe("每個專案最多讀取檔案數（覆蓋模式預設值）"),
+      maxResults: z.number().int().min(1).max(500).optional().describe("最多回傳命中結果數（覆蓋模式預設值）"),
     }, 
-    async ({ query, scope = "blobs" }) => {
-    console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}）`);
+    async ({ query, scope = "blobs", mode = "balanced", maxProjects, maxFilesPerProject, maxResults }) => {
+    console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}, 模式：${mode}）`);
     
     try {
-      const { results, strategy } = await searchCodeInGroup(query, scope, 50);
+      const searchOptions: {
+        scanMode?: "fast" | "balanced" | "deep";
+        maxProjects?: number;
+        maxFilesReadPerProject?: number;
+        maxMatchedResults?: number;
+      } = { scanMode: mode === "hybrid" ? "fast" : mode };
+
+      if (typeof maxProjects === "number") {
+        searchOptions.maxProjects = maxProjects;
+      }
+      if (typeof maxFilesPerProject === "number") {
+        searchOptions.maxFilesReadPerProject = maxFilesPerProject;
+      }
+      if (typeof maxResults === "number") {
+        searchOptions.maxMatchedResults = maxResults;
+      }
+
+      let { results, strategy } = await searchCodeInGroup(query, scope, 50, searchOptions);
+
+      if (mode === "hybrid") {
+        const firstPhaseCount = results.length;
+        const shouldBackfill = strategy === "manual-content-scan-fallback" || firstPhaseCount < 20;
+
+        if (shouldBackfill) {
+          const deepOptions: {
+            scanMode: "deep";
+            maxProjects?: number;
+            maxFilesReadPerProject?: number;
+            maxMatchedResults?: number;
+          } = { scanMode: "deep" };
+
+          if (typeof maxProjects === "number") {
+            deepOptions.maxProjects = maxProjects;
+          }
+          if (typeof maxFilesPerProject === "number") {
+            deepOptions.maxFilesReadPerProject = maxFilesPerProject;
+          }
+          if (typeof maxResults === "number") {
+            deepOptions.maxMatchedResults = maxResults;
+          }
+
+          const { results: deepResults } = await searchCodeInGroup(query, scope, 50, deepOptions);
+          const merged = uniqueResults([...results, ...deepResults]);
+          const finalResults = typeof maxResults === "number" ? merged.slice(0, maxResults) : merged;
+          results = finalResults;
+          strategy = `two-phase-hybrid (fast:${firstPhaseCount} + deep:${deepResults.length})`;
+        } else {
+          strategy = `two-phase-hybrid (fast-only:${firstPhaseCount})`;
+        }
+      }
       
       console.log(`[search_code] 找到 ${results.length} 筆結果，策略：${strategy}`);
       

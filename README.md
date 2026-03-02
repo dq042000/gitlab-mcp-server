@@ -54,6 +54,19 @@ MCP 連線模式與常見錯誤
 - 若遇到 `Request failed with status code 400`，通常代表請求不是 `initialize` 且 session 無效。
 - 若遇到 `Session not found`，請讓客戶端重新 initialize（重新連線）。
 
+`search_code`（無 Elasticsearch）調校建議
+
+- 可用 `mode` 控制掃描策略：
+	- `fast`：較快（掃描範圍較小）
+	- `balanced`：預設（速度與完整度平衡）
+	- `deep`：較完整（掃描範圍較大）
+	- `hybrid`：先 `fast` 再 `deep` 補抓（建議查漏時使用）
+- 可選參數：
+	- `maxProjects`：最多掃描專案數
+	- `maxFilesPerProject`：每個專案最多讀取檔案數
+	- `maxResults`：最多回傳結果數
+- 多關鍵字請用 `|` 分隔，例如：`臺銀|台銀|繳費|virtual_account|bank_code`
+
 相依與建議工具
 
 - Node.js (v16+ 建議)
