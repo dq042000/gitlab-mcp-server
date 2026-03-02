@@ -11,11 +11,11 @@ dotenv.config();
 
 const GITLAB_API = process.env.GITLAB_API;
 const GROUP_TOKEN = process.env.GITLAB_GROUP_TOKEN;
-const PLATFORM_GROUP_ID = process.env.PLATFORM_GROUP_ID;
+const PLATFORM_GROUP_ID = process.env.PLATFORM_GROUP_ID?.trim();
 const PORT = Number(process.env.PORT) || 4321;
 const URL = process.env.URL || "";
 
-if (!GITLAB_API || !GROUP_TOKEN || !PLATFORM_GROUP_ID || !URL) {
+if (!GITLAB_API || !GROUP_TOKEN || !URL) {
   console.error("❌ 缺少環境變數");
   process.exit(1);
 }
@@ -33,6 +33,65 @@ function createMcpServer() {
     name: "GitLab-Platform-Assistant",
     version: "1.0.0",
   });
+
+  const getProjectsEndpointConfig = () => {
+    if (PLATFORM_GROUP_ID) {
+      return {
+        mode: "group" as const,
+        url: `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects`,
+        baseParams: {
+          include_subgroups: true,
+          simple: true,
+          order_by: "last_activity_at",
+        },
+      };
+    }
+
+    return {
+      mode: "membership" as const,
+      url: `${GITLAB_API}/projects`,
+      baseParams: {
+        membership: true,
+        simple: true,
+        order_by: "last_activity_at",
+      },
+    };
+  };
+
+  const listAccessibleProjects = async (options?: { maxProjects?: number }) => {
+    const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+    const { url, baseParams } = getProjectsEndpointConfig();
+    const perPage = 100;
+    const allProjects: Array<any> = [];
+    let page = 1;
+
+    while (true) {
+      const response = await axios.get(url, {
+        headers,
+        params: {
+          ...baseParams,
+          per_page: perPage,
+          page,
+        },
+      });
+
+      const data = Array.isArray(response.data) ? response.data : [];
+      allProjects.push(...data);
+
+      if (options?.maxProjects && allProjects.length >= options.maxProjects) {
+        return allProjects.slice(0, options.maxProjects);
+      }
+
+      const nextPage = Number(response.headers["x-next-page"] || "0");
+      if (!nextPage || data.length === 0) {
+        break;
+      }
+
+      page = nextPage;
+    }
+
+    return allProjects;
+  };
 
   const splitKeywords = (rawQuery: string) => {
     return Array.from(new Set(
@@ -93,18 +152,7 @@ function createMcpServer() {
     const readConcurrency = defaults.readConcurrency;
     const treeCacheTtlMs = defaults.treeCacheTtlMs;
 
-    const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects`;
-    const projectResponse = await axios.get(projectsUrl, {
-      headers,
-      params: {
-        include_subgroups: true,
-        per_page: 100,
-        order_by: "last_activity_at",
-        simple: true,
-      },
-    });
-
-    const projects = Array.isArray(projectResponse.data) ? projectResponse.data : [];
+    const projects = await listAccessibleProjects({ maxProjects });
     const projectsToScan = projects.slice(0, maxProjects);
     const allowedExtensions = [
       ".php", ".ts", ".js", ".vue", ".json", ".yml", ".yaml", ".xml",
@@ -255,18 +303,27 @@ function createMcpServer() {
     const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
     const diagnostics: string[] = [];
     const keywords = splitKeywords(query);
-    const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [
-      {
+    const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [];
+
+    if (PLATFORM_GROUP_ID) {
+      attempts.push({
         name: "group-search-endpoint",
         url: `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search`,
         params: { scope, search: keywords[0] || query, per_page: perPage },
-      },
-      {
+      });
+
+      attempts.push({
         name: "global-search-with-group-id",
         url: `${GITLAB_API}/search`,
         params: { scope, search: keywords[0] || query, group_id: String(PLATFORM_GROUP_ID), per_page: perPage },
-      },
-    ];
+      });
+    } else {
+      attempts.push({
+        name: "global-search-membership-scope",
+        url: `${GITLAB_API}/search`,
+        params: { scope, search: keywords[0] || query, per_page: perPage },
+      });
+    }
 
     let lastError: any = null;
     for (const attempt of attempts) {
@@ -317,41 +374,25 @@ function createMcpServer() {
 
   server.tool(
     "list_platform_projects", 
-    "列出平台群組專案。💡 這是探索專案的第一步，取得所有專案清單後可搭配其他工具深入查詢。", 
+    "列出可存取專案。💡 若設定 PLATFORM_GROUP_ID 則限定該群組（含子群組）；未設定則列出 token 可存取專案。", 
     {}, 
     async () => {
     try {
-      const perPage = 100;
-      let page = 1;
-      const projects: Array<any> = [];
+      const projects = await listAccessibleProjects();
+      const mappedProjects = projects.map(p => ({
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        path: p.path_with_namespace,
+      }));
 
-      while (true) {
-        const url = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects?include_subgroups=true&per_page=${perPage}&page=${page}&simple=true&order_by=last_activity_at`;
-        const response = await axios.get(url, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
-        const data = Array.isArray(response.data) ? response.data : [];
-
-        for (const p of data) {
-          projects.push({ id: p.id, name: p.name, description: p.description, path: p.path_with_namespace });
-        }
-
-        // 使用 x-total-pages 作為主要分頁判斷（比 x-next-page 更可靠）
-        const totalPages = Number(response.headers["x-total-pages"] ?? "1");
-        const total = response.headers["x-total"] ?? "?";
-        console.log(`[list_platform_projects] page ${page}/${totalPages}, x-total: ${total}, this page: ${data.length}, accumulated: ${projects.length}`);
-
-        if (page >= totalPages || data.length === 0) {
-          break;
-        }
-        page++;
-      }
-
-      if (projects.length === 0) {
+      if (mappedProjects.length === 0) {
         console.warn(`[list_platform_projects] empty result after pagination`);
       } else {
-        console.log(`[list_platform_projects] fetched ${projects.length} projects across pages`);
+        console.log(`[list_platform_projects] fetched ${mappedProjects.length} projects across pages`);
       }
 
-      return { content: [{ type: "text", text: JSON.stringify(projects, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(mappedProjects, null, 2) }] };
     } catch (error: any) {
       const status = error.response?.status;
       const body = error.response?.data;
@@ -378,9 +419,7 @@ function createMcpServer() {
     
     try {
       // 先取得專案列表
-      const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects?include_subgroups=true&per_page=100&order_by=last_activity_at`;
-      const projectsResponse = await axios.get(projectsUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
-      const allProjects = Array.isArray(projectsResponse.data) ? projectsResponse.data : [];
+      const allProjects = await listAccessibleProjects({ maxProjects });
       
       console.log(`[search_projects_by_file] 找到 ${allProjects.length} 個專案，將檢查前 ${Math.min(maxProjects, allProjects.length)} 個`);
       
@@ -444,7 +483,7 @@ function createMcpServer() {
 
   server.tool(
     "search_code", 
-    "在群組內搜尋程式碼或檔案內容。💡 當不確定檔案位置或想搜尋程式碼片段時使用。找到結果後可用 read_project_file 讀取完整內容。", 
+    "在可存取範圍內搜尋程式碼或檔案內容。💡 有設定 PLATFORM_GROUP_ID 時限定該群組；未設定時以 token 可存取範圍搜尋。", 
     {
       query: z.string().describe("搜尋關鍵字，例如：臺銀、esunbank、PaymentService、virtual_account"),
       scope: z.enum(["blobs", "wiki_blobs"]).optional().describe("搜尋範圍（預設 blobs = 程式碼檔案）"),

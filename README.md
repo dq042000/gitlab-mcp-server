@@ -54,6 +54,16 @@ MCP 連線模式與常見錯誤
 - 若遇到 `Request failed with status code 400`，通常代表請求不是 `initialize` 且 session 無效。
 - 若遇到 `Session not found`，請讓客戶端重新 initialize（重新連線）。
 
+環境變數設定
+
+- `GITLAB_API`：GitLab API Base URL（例如 `https://gitlab.example.com/api/v4`）
+- `GITLAB_GROUP_TOKEN`：GitLab Token（建議至少有 `read_api`）
+- `PLATFORM_GROUP_ID`：**選填**
+	- 有填：只查詢該群組（含子群組）底下專案
+	- 未填：查詢 token 可存取的專案（`membership=true`）
+- `PORT`：伺服器埠號（選填）
+- `URL`：伺服器對外位址
+
 `search_code`（無 Elasticsearch）調校建議
 
 - 可用 `mode` 控制掃描策略：
@@ -69,14 +79,16 @@ MCP 連線模式與常見錯誤
 
 GitLab Token 權限建議（`GITLAB_GROUP_TOKEN`）
 
-- **建議類型**：`Group Access Token`
+- **建議類型**：
+	- 有設定 `PLATFORM_GROUP_ID`：`Group Access Token`
+	- 未設定 `PLATFORM_GROUP_ID`：建議 `Personal Access Token`
 - **最小 Scope**：`read_api`
-- **建議角色**：至少 `Reporter`（可讀取群組內專案與 repository 內容）
+- **建議角色**：至少 `Reporter`（可讀取可存取範圍內專案與 repository 內容）
 - **不需要開啟**：`write_repository`、`read_registry`、`write_registry`
 
 說明：本專案目前僅使用 GitLab 讀取型 API（`GET/HEAD`），包含：
 
-- 列出群組專案
+- 列出可存取專案（群組範圍或 membership 範圍）
 - 搜尋程式碼
 - 讀取檔案內容
 - 讀取分支與目錄樹

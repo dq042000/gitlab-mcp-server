@@ -1,6 +1,10 @@
 # GitLab 設定
 GITLAB_API=https://<gitlab-domain>/api/v4
+
+# GitLab 存取權杖，請至 GitLab 產生 Personal Access Token，並至少勾選 read_api 權限
 GITLAB_GROUP_TOKEN=
+
+# 選填：有填則限定群組（含子群組）；未填則查詢 token 可存取專案
 PLATFORM_GROUP_ID=
 
 # 伺服器設定 (選填)
