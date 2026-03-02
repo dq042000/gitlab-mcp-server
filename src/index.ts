@@ -27,6 +27,47 @@ function createMcpServer() {
     version: "1.0.0",
   });
 
+  const searchCodeInGroup = async (query: string, scope: "blobs" | "wiki_blobs", perPage: number) => {
+    const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+    const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [
+      {
+        name: "group-search-endpoint",
+        url: `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search`,
+        params: { scope, search: query, per_page: perPage },
+      },
+      {
+        name: "global-search-with-group-id",
+        url: `${GITLAB_API}/search`,
+        params: { scope, search: query, group_id: String(PLATFORM_GROUP_ID), per_page: perPage },
+      },
+    ];
+
+    let lastError: any = null;
+    for (const attempt of attempts) {
+      try {
+        const response = await axios.get(attempt.url, { headers, params: attempt.params });
+        const results = Array.isArray(response.data) ? response.data : [];
+        return { results, strategy: attempt.name };
+      } catch (error: any) {
+        const status = error.response?.status;
+        const body = error.response?.data;
+        lastError = error;
+
+        console.warn(`[searchCodeInGroup] ${attempt.name} 失敗`, {
+          status,
+          body,
+          message: error.message,
+        });
+
+        if (status !== 400) {
+          throw error;
+        }
+      }
+    }
+
+    throw lastError;
+  };
+
   server.tool(
     "list_platform_projects", 
     "列出平台群組專案。💡 這是探索專案的第一步，取得所有專案清單後可搭配其他工具深入查詢。", 
@@ -165,11 +206,9 @@ function createMcpServer() {
     console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}）`);
     
     try {
-      const searchUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search?scope=${scope}&search=${encodeURIComponent(query)}&per_page=50`;
-      const response = await axios.get(searchUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
-      const results = Array.isArray(response.data) ? response.data : [];
+      const { results, strategy } = await searchCodeInGroup(query, scope, 50);
       
-      console.log(`[search_code] 找到 ${results.length} 筆結果`);
+      console.log(`[search_code] 找到 ${results.length} 筆結果，策略：${strategy}`);
       
       if (results.length === 0) {
         return {
@@ -190,7 +229,7 @@ function createMcpServer() {
         groupedResults.get(projectName)!.push(result);
       }
       
-      let output = `找到 ${results.length} 筆包含 "${query}" 的程式碼：\n\n`;
+      let output = `找到 ${results.length} 筆包含 "${query}" 的程式碼（策略：${strategy}）：\n\n`;
       
       for (const [projectName, items] of groupedResults.entries()) {
         output += `## ${projectName} (${items.length} 筆)\n\n`;
@@ -213,11 +252,12 @@ function createMcpServer() {
       };
     } catch (error: any) {
       const status = error.response?.status;
+      const body = error.response?.data;
       console.error(`[search_code] 失敗`, { status, message: error.message });
       return {
         content: [{
           type: "text",
-          text: `搜尋失敗: ${error.message}${status === 403 ? "\n\n可能是權限不足或 Token 沒有搜尋權限" : ""}`,
+          text: `搜尋失敗: ${error.message}${status ? ` (HTTP ${status})` : ""}${body ? `\n回應: ${JSON.stringify(body)}` : ""}${status === 403 ? "\n\n可能是權限不足或 Token 沒有搜尋權限" : ""}`,
         }],
         isError: true,
       };
@@ -471,9 +511,7 @@ function createMcpServer() {
         // 對每個關鍵字進行搜尋
         for (const keyword of autoKeywords.slice(0, 5)) {
           try {
-            const searchUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search?scope=blobs&search=${encodeURIComponent(keyword)}&per_page=20`;
-            const response = await axios.get(searchUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
-            const searchResults = Array.isArray(response.data) ? response.data : [];
+            const { results: searchResults } = await searchCodeInGroup(keyword, "blobs", 20);
 
             for (const result of searchResults) {
               if (result.project_id?.toString() === projectId || result.project_id === parseInt(projectId)) {
