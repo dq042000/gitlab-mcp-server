@@ -618,6 +618,23 @@ app.use(express.json());
 // ── Streamable HTTP Transport（新版協議，供現代 MCP 客戶端使用）───────────────
 const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
 const sessionLastActivity = new Map<string, number>();
+let statelessTransport: StreamableHTTPServerTransport | null = null;
+let statelessServerReady: Promise<void> | null = null;
+
+async function getOrCreateStatelessTransport() {
+  if (!statelessTransport) {
+    statelessTransport = new StreamableHTTPServerTransport();
+    const mcpServer = createMcpServer();
+    statelessServerReady = mcpServer.connect(statelessTransport as any);
+    console.log(`[${new Date().toLocaleTimeString()}] ✅ [Stateless] transport 已建立`);
+  }
+
+  if (statelessServerReady) {
+    await statelessServerReady;
+  }
+
+  return statelessTransport;
+}
 
 // 定期輸出當前活躍的 session 數量（每 30 秒）
 setInterval(() => {
@@ -657,8 +674,28 @@ app.post("/mcp", async (req, res) => {
     return;
   }
 
+  if (sessionId && !transport) {
+    res.status(404).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Session not found: 請重新 initialize" },
+      id: null,
+    });
+    return;
+  }
+
+  if (!sessionId) {
+    const fallbackTransport = await getOrCreateStatelessTransport();
+    console.log(`[${new Date().toLocaleTimeString()}] [Stateless] 處理無 session 請求`);
+    await fallbackTransport.handleRequest(req, res, req.body);
+    return;
+  }
+
   if (!isInitializeRequest(req.body)) {
-    res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: 非 initialize 請求且無有效 session" }, id: null });
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Bad Request: 非 initialize 請求且無有效 session" },
+      id: null,
+    });
     return;
   }
 

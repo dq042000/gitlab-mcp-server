@@ -46,6 +46,14 @@ npm start
 npm run dev
 ```
 
+MCP 連線模式與常見錯誤
+
+- 伺服器同時支援兩種模式：
+	- Stateful：客戶端帶 `mcp-session-id`，伺服器維護 session。
+	- Stateless：客戶端未帶 `mcp-session-id`，伺服器會以無 session 模式處理請求。
+- 若遇到 `Request failed with status code 400`，通常代表請求不是 `initialize` 且 session 無效。
+- 若遇到 `Session not found`，請讓客戶端重新 initialize（重新連線）。
+
 相依與建議工具
 
 - Node.js (v16+ 建議)
