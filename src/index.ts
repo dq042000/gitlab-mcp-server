@@ -29,6 +29,7 @@ function createMcpServer() {
 
   const searchCodeInGroup = async (query: string, scope: "blobs" | "wiki_blobs", perPage: number) => {
     const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+    const diagnostics: string[] = [];
     const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [
       {
         name: "group-search-endpoint",
@@ -45,13 +46,16 @@ function createMcpServer() {
     let lastError: any = null;
     for (const attempt of attempts) {
       try {
+        console.log(`[searchCodeInGroup] 嘗試策略: ${attempt.name}`, { query, scope, perPage });
         const response = await axios.get(attempt.url, { headers, params: attempt.params });
         const results = Array.isArray(response.data) ? response.data : [];
+        console.log(`[searchCodeInGroup] 策略成功: ${attempt.name}, 結果 ${results.length} 筆`);
         return { results, strategy: attempt.name };
       } catch (error: any) {
         const status = error.response?.status;
         const body = error.response?.data;
         lastError = error;
+        diagnostics.push(`${attempt.name}: HTTP ${status ?? "unknown"}${body ? ` => ${JSON.stringify(body)}` : ""}`);
 
         console.warn(`[searchCodeInGroup] ${attempt.name} 失敗`, {
           status,
@@ -60,12 +64,75 @@ function createMcpServer() {
         });
 
         if (status !== 400) {
+          (error as any).diagnostics = diagnostics;
           throw error;
         }
       }
     }
 
-    throw lastError;
+    try {
+      console.log(`[searchCodeInGroup] 進入 fallback：逐專案搜尋`, { query, scope });
+      const projectsUrl = `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/projects`;
+      const projectsResponse = await axios.get(projectsUrl, {
+        headers,
+        params: {
+          include_subgroups: true,
+          per_page: 100,
+          order_by: "last_activity_at",
+          simple: true,
+        },
+      });
+
+      const projects = Array.isArray(projectsResponse.data) ? projectsResponse.data : [];
+      const aggregatedResults: Array<any> = [];
+      const maxResults = 200;
+
+      for (const project of projects) {
+        const projectId = project?.id;
+        if (!projectId) continue;
+
+        try {
+          const projectSearchUrl = `${GITLAB_API}/projects/${encodeURIComponent(String(projectId))}/search`;
+          const projectSearchResponse = await axios.get(projectSearchUrl, {
+            headers,
+            params: {
+              scope,
+              search: query,
+              per_page: 20,
+            },
+          });
+
+          const projectResults = Array.isArray(projectSearchResponse.data) ? projectSearchResponse.data : [];
+          if (projectResults.length > 0) {
+            aggregatedResults.push(...projectResults);
+          }
+
+          if (aggregatedResults.length >= maxResults) {
+            break;
+          }
+        } catch (projectError: any) {
+          const projectStatus = projectError.response?.status;
+          const projectBody = projectError.response?.data;
+          console.warn(`[searchCodeInGroup] 專案 ${projectId} 搜尋失敗`, {
+            status: projectStatus,
+            body: projectBody,
+            message: projectError.message,
+          });
+        }
+      }
+
+      console.log(`[searchCodeInGroup] fallback 完成，結果 ${aggregatedResults.length} 筆`);
+      return {
+        results: aggregatedResults.slice(0, maxResults),
+        strategy: "project-by-project-fallback",
+      };
+    } catch (fallbackError: any) {
+      const fallbackStatus = fallbackError.response?.status;
+      const fallbackBody = fallbackError.response?.data;
+      diagnostics.push(`project-by-project-fallback: HTTP ${fallbackStatus ?? "unknown"}${fallbackBody ? ` => ${JSON.stringify(fallbackBody)}` : ""}`);
+      (fallbackError as any).diagnostics = diagnostics;
+      throw fallbackError;
+    }
   };
 
   server.tool(
@@ -253,11 +320,12 @@ function createMcpServer() {
     } catch (error: any) {
       const status = error.response?.status;
       const body = error.response?.data;
-      console.error(`[search_code] 失敗`, { status, message: error.message });
+      const diagnostics = (error as any).diagnostics as string[] | undefined;
+      console.error(`[search_code] 失敗`, { status, body, message: error.message, diagnostics });
       return {
         content: [{
           type: "text",
-          text: `搜尋失敗: ${error.message}${status ? ` (HTTP ${status})` : ""}${body ? `\n回應: ${JSON.stringify(body)}` : ""}${status === 403 ? "\n\n可能是權限不足或 Token 沒有搜尋權限" : ""}`,
+          text: `搜尋失敗: ${error.message}${status ? ` (HTTP ${status})` : ""}${body ? `\n回應: ${JSON.stringify(body)}` : ""}${diagnostics && diagnostics.length > 0 ? `\n診斷:\n- ${diagnostics.join("\n- ")}` : ""}${status === 403 ? "\n\n可能是權限不足或 Token 沒有搜尋權限" : ""}`,
         }],
         isError: true,
       };
@@ -652,6 +720,13 @@ function createMcpServer() {
 // --- Express 初始化 ---
 const app = express();
 app.use(express.json());
+app.use((req, _res, next) => {
+  if (req.path === "/mcp") {
+    const sid = (req.headers["mcp-session-id"] as string | undefined) || "-";
+    console.log(`[${new Date().toLocaleTimeString()}] [MCP] ${req.method} ${req.path} sid=${sid}`);
+  }
+  next();
+});
 
 // ── Streamable HTTP Transport（新版協議，供現代 MCP 客戶端使用）───────────────
 const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
