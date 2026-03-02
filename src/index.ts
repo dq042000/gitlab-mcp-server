@@ -597,10 +597,13 @@ function createMcpServer() {
         const status = error.response?.status;
         const body = error.response?.data;
         console.error(`[read_project_file] 指定分支失敗`, { status, body, ref, message: error.message });
+        const permissionHint = status === 401 || status === 403
+          ? "\n\n⚠️ 偵測到權限錯誤，請確認 Token 具備該專案的讀取權限（至少 read_api）。"
+          : "";
         return {
           content: [{
             type: "text",
-            text: `讀取失敗：projectId=${projectId}, filePath=${filePath}, ref=${ref}\n${status ? `HTTP ${status}\n` : ""}${body ? `回應: ${JSON.stringify(body)}\n` : ""}錯誤: ${error.message}\n\n💡 建議下一步操作：\n1. 使用 explore_project_structure 查看專案目錄結構\n2. 使用 search_code 搜尋檔案名稱找出正確路徑\n3. 確認 projectId 格式（可用專案路徑或數字 ID）\n4. 檢查是否有權限存取該專案`,
+            text: `讀取失敗：projectId=${projectId}, filePath=${filePath}, ref=${ref}\n${status ? `HTTP ${status}\n` : ""}${body ? `回應: ${JSON.stringify(body)}\n` : ""}錯誤: ${error.message}${permissionHint}\n\n💡 建議下一步操作：\n1. 使用 explore_project_structure 查看專案目錄結構\n2. 使用 search_code 搜尋檔案名稱找出正確路徑\n3. 確認 projectId 格式（可用專案路徑或數字 ID）\n4. 檢查是否有權限存取該專案`,
           }],
           isError: true,
         };
@@ -642,6 +645,9 @@ function createMcpServer() {
 
     console.log(`[read_project_file] 搜尋順序（前 10 個）: ${sortedBranches.slice(0, 10).join(" → ")}${sortedBranches.length > 10 ? ` ...等共 ${sortedBranches.length} 個` : ""}`);
 
+    const permissionErrors: Array<{ branch: string; status: number }> = [];
+    const otherErrors: Array<{ branch: string; status: number | string }> = [];
+
     // 逐一嘗試每個分支
     for (const branch of sortedBranches) {
       try {
@@ -659,6 +665,12 @@ function createMcpServer() {
           // 繼續下一個分支
           continue;
         }
+        if (status === 401 || status === 403) {
+          permissionErrors.push({ branch, status });
+          console.warn(`[read_project_file] ✗ 分支 "${branch}" 權限不足 (${status})`);
+          continue;
+        }
+        otherErrors.push({ branch, status: status || "unknown" });
         // 非 404 錯誤：記錄但繼續嘗試
         console.warn(`[read_project_file] ✗ 分支 "${branch}" 發生錯誤 (${status})，繼續嘗試下一個`);
       }
@@ -666,10 +678,16 @@ function createMcpServer() {
 
     // 所有分支都找不到
     console.error(`[read_project_file] ❌ 在所有 ${sortedBranches.length} 個分支中都找不到檔案`);
+    const permissionSummary = permissionErrors.length > 0
+      ? `\n\n⚠️ 權限診斷：${permissionErrors.length} 個分支發生 401/403（${permissionErrors.slice(0, 8).map(item => `${item.branch}:${item.status}`).join(", ")}${permissionErrors.length > 8 ? " ..." : ""}）。\n這通常代表 Token 對該專案或部分保護分支缺少讀取權限。`
+      : "";
+    const otherErrorSummary = otherErrors.length > 0
+      ? `\n\nℹ️ 其他錯誤：${otherErrors.length} 個分支發生非 404 錯誤（${otherErrors.slice(0, 6).map(item => `${item.branch}:${item.status}`).join(", ")}${otherErrors.length > 6 ? " ..." : ""}）。`
+      : "";
     return {
       content: [{
         type: "text",
-        text: `讀取失敗：projectId=${projectId}, filePath=${filePath}\n\n已搜尋所有 ${sortedBranches.length} 個分支，皆未找到該檔案。\n\n💡 建議下一步操作：\n1. 使用 explore_project_structure 查看專案實際目錄結構\n2. 使用 search_code 搜尋檔案名稱 "${filePath.split('/').pop()}"\n3. 確認檔案路徑大小寫是否正確\n4. 確認 projectId 格式（可用專案路徑或數字 ID）\n\n可能原因：\n- 檔案路徑不正確（請確認大小寫與完整路徑）\n- 檔案確實不存在於任何分支\n- Token 權限不足\n\n已搜尋的分支：${sortedBranches.slice(0, 20).join(", ")}${sortedBranches.length > 20 ? ` ...等共 ${sortedBranches.length} 個` : ""}`,
+        text: `讀取失敗：projectId=${projectId}, filePath=${filePath}\n\n已嘗試 ${sortedBranches.length} 個分支，未成功讀取檔案。${permissionSummary}${otherErrorSummary}\n\n💡 建議下一步操作：\n1. 使用 explore_project_structure 查看專案實際目錄結構\n2. 使用 search_code 搜尋檔案名稱 "${filePath.split('/').pop()}"\n3. 確認檔案路徑大小寫是否正確\n4. 確認 projectId 格式（可用專案路徑或數字 ID）\n\n可能原因：\n- 檔案路徑不正確（請確認大小寫與完整路徑）\n- 檔案確實不存在於任何可存取分支\n- Token 權限不足（尤其當出現 401/403）\n\n已嘗試的分支：${sortedBranches.slice(0, 20).join(", ")}${sortedBranches.length > 20 ? ` ...等共 ${sortedBranches.length} 個` : ""}`,
       }],
       isError: true,
     };
