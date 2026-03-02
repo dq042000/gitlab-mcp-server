@@ -731,22 +731,13 @@ app.use((req, _res, next) => {
 // ── Streamable HTTP Transport（新版協議，供現代 MCP 客戶端使用）───────────────
 const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
 const sessionLastActivity = new Map<string, number>();
-let statelessTransport: StreamableHTTPServerTransport | null = null;
-let statelessServerReady: Promise<void> | null = null;
-
-async function getOrCreateStatelessTransport() {
-  if (!statelessTransport) {
-    statelessTransport = new StreamableHTTPServerTransport();
-    const mcpServer = createMcpServer();
-    statelessServerReady = mcpServer.connect(statelessTransport as any);
-    console.log(`[${new Date().toLocaleTimeString()}] ✅ [Stateless] transport 已建立`);
-  }
-
-  if (statelessServerReady) {
-    await statelessServerReady;
-  }
-
-  return statelessTransport;
+async function handleStatelessMcpRequest(req: express.Request, res: express.Response) {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined as unknown as () => string,
+  });
+  const mcpServer = createMcpServer();
+  await mcpServer.connect(transport as any);
+  await transport.handleRequest(req, res, req.body);
 }
 
 // 定期輸出當前活躍的 session 數量（每 30 秒）
@@ -776,64 +767,80 @@ setInterval(() => {
 }, 5 * 60 * 1000); // 每 5 分鐘檢查一次
 
 app.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  let transport = sessionId ? streamableTransports.get(sessionId) : undefined;
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    let transport = sessionId ? streamableTransports.get(sessionId) : undefined;
 
-  if (transport) {
-    // 已存在的 session：直接轉發請求
-    console.log(`[${new Date().toLocaleTimeString()}] [Streamable] 既有 session: ${sessionId}`);
-    if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
-    await transport.handleRequest(req, res, req.body);
-    return;
-  }
-
-  if (sessionId && !transport) {
-    res.status(404).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "Session not found: 請重新 initialize" },
-      id: null,
-    });
-    return;
-  }
-
-  if (!sessionId) {
-    const fallbackTransport = await getOrCreateStatelessTransport();
-    console.log(`[${new Date().toLocaleTimeString()}] [Stateless] 處理無 session 請求`);
-    await fallbackTransport.handleRequest(req, res, req.body);
-    return;
-  }
-
-  if (!isInitializeRequest(req.body)) {
-    res.status(400).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Bad Request: 非 initialize 請求且無有效 session" },
-      id: null,
-    });
-    return;
-  }
-
-  // 新 session：建立 Streamable HTTP Transport
-  transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (sid) => {
-      streamableTransports.set(sid, transport!);
-      sessionLastActivity.set(sid, Date.now()); // 記錄建立時間
-      console.log(`[${new Date().toLocaleTimeString()}] ✅ [Streamable] session 建立: ${sid}`);
-    },
-  });
-
-  transport.onclose = () => {
-    if (transport!.sessionId) {
-      streamableTransports.delete(transport!.sessionId);
-      sessionLastActivity.delete(transport!.sessionId); // 清理活動記錄
-      console.log(`[${new Date().toLocaleTimeString()}] 🔌 [Streamable] session 關閉: ${transport!.sessionId}`);
+    if (transport) {
+      // 已存在的 session：直接轉發請求
+      console.log(`[${new Date().toLocaleTimeString()}] [Streamable] 既有 session: ${sessionId}`);
+      if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
+      await transport.handleRequest(req, res, req.body);
+      return;
     }
-  };
 
-  const mcpServer = createMcpServer();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await mcpServer.connect(transport as any);
-  await transport.handleRequest(req, res, req.body);
+    if (!sessionId && isInitializeRequest(req.body)) {
+      // 新 session：建立 Streamable HTTP Transport
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          streamableTransports.set(sid, transport!);
+          sessionLastActivity.set(sid, Date.now()); // 記錄建立時間
+          console.log(`[${new Date().toLocaleTimeString()}] ✅ [Streamable] session 建立: ${sid}`);
+        },
+      });
+
+      transport.onclose = () => {
+        if (transport!.sessionId) {
+          streamableTransports.delete(transport!.sessionId);
+          sessionLastActivity.delete(transport!.sessionId); // 清理活動記錄
+          console.log(`[${new Date().toLocaleTimeString()}] 🔌 [Streamable] session 關閉: ${transport!.sessionId}`);
+        }
+      };
+
+      const mcpServer = createMcpServer();
+      await mcpServer.connect(transport as any);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    if (sessionId && !transport) {
+      res.status(404).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found: 請重新 initialize" },
+        id: null,
+      });
+      return;
+    }
+
+    if (!sessionId) {
+      console.log(`[${new Date().toLocaleTimeString()}] [Stateless] 單次請求 fallback`);
+      await handleStatelessMcpRequest(req, res);
+      return;
+    }
+
+    if (!isInitializeRequest(req.body)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: 非 initialize 請求且無有效 session" },
+        id: null,
+      });
+      return;
+    }
+  } catch (error: any) {
+    console.error(`[MCP][POST] 失敗`, {
+      message: error?.message,
+      stack: error?.stack,
+      body: req.body,
+    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: `Internal error: ${error?.message ?? "unknown"}` },
+        id: null,
+      });
+    }
+  }
 });
 
 app.get("/mcp", async (req, res) => {
