@@ -1021,6 +1021,46 @@ app.use((req, _res, next) => {
 // ── Streamable HTTP Transport（新版協議，供現代 MCP 客戶端使用）───────────────
 const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
 const sessionLastActivity = new Map<string, number>();
+
+const isBenignStreamTermination = (error: unknown) => {
+  const message = String((error as any)?.message || "").toLowerCase();
+  const code = String((error as any)?.code || "").toLowerCase();
+  return (
+    message.includes("terminated") ||
+    message.includes("aborted") ||
+    code === "econnreset" ||
+    code === "err_stream_premature_close"
+  );
+};
+
+const removeSession = (sessionId: string) => {
+  streamableTransports.delete(sessionId);
+  sessionLastActivity.delete(sessionId);
+};
+
+const closeSessionTransport = async (
+  sessionId: string,
+  reason: "timeout" | "delete" | "error" | "close-event"
+) => {
+  const transport = streamableTransports.get(sessionId) as any;
+
+  if (reason !== "close-event" && transport?.close) {
+    try {
+      await Promise.resolve(transport.close());
+    } catch (closeError: any) {
+      if (!isBenignStreamTermination(closeError)) {
+        console.warn(`[Streamable] 關閉 session 失敗`, {
+          sessionId,
+          reason,
+          message: closeError?.message,
+        });
+      }
+    }
+  }
+
+  removeSession(sessionId);
+};
+
 async function handleStatelessMcpRequest(req: express.Request, res: express.Response) {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined as unknown as () => string,
@@ -1046,12 +1086,8 @@ setInterval(() => {
   
   for (const [sessionId, lastActivity] of sessionLastActivity.entries()) {
     if (now - lastActivity > timeout) {
-      const transport = streamableTransports.get(sessionId);
-      if (transport) {
-        console.log(`[${new Date().toLocaleTimeString()}] ⏰ Session ${sessionId} 超時，自動清理`);
-        streamableTransports.delete(sessionId);
-        sessionLastActivity.delete(sessionId);
-      }
+      console.log(`[${new Date().toLocaleTimeString()}] ⏰ Session ${sessionId} 超時，自動清理`);
+      void closeSessionTransport(sessionId, "timeout");
     }
   }
 }, 5 * 60 * 1000); // 每 5 分鐘檢查一次
@@ -1082,8 +1118,7 @@ app.post("/mcp", async (req, res) => {
 
       transport.onclose = () => {
         if (transport!.sessionId) {
-          streamableTransports.delete(transport!.sessionId);
-          sessionLastActivity.delete(transport!.sessionId); // 清理活動記錄
+          void closeSessionTransport(transport!.sessionId, "close-event");
           console.log(`[${new Date().toLocaleTimeString()}] 🔌 [Streamable] session 關閉: ${transport!.sessionId}`);
         }
       };
@@ -1118,11 +1153,17 @@ app.post("/mcp", async (req, res) => {
       return;
     }
   } catch (error: any) {
-    console.error(`[MCP][POST] 失敗`, {
-      message: error?.message,
-      stack: error?.stack,
-      body: req.body,
-    });
+    if (isBenignStreamTermination(error)) {
+      console.info(`[MCP][POST] 串流連線中斷（可忽略）`, {
+        message: error?.message,
+      });
+    } else {
+      console.error(`[MCP][POST] 失敗`, {
+        message: error?.message,
+        stack: error?.stack,
+        body: req.body,
+      });
+    }
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -1134,32 +1175,55 @@ app.post("/mcp", async (req, res) => {
 });
 
 app.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const transport = sessionId ? streamableTransports.get(sessionId) : undefined;
-  if (!transport) {
-    res.status(404).send("Session not found");
-    return;
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const transport = sessionId ? streamableTransports.get(sessionId) : undefined;
+    if (!transport) {
+      res.status(404).send("Session not found");
+      return;
+    }
+    if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
+    await transport.handleRequest(req, res);
+  } catch (error: any) {
+    if (!isBenignStreamTermination(error)) {
+      console.error(`[MCP][GET] 失敗`, {
+        message: error?.message,
+        stack: error?.stack,
+      });
+    }
+    if (!res.headersSent) {
+      res.status(500).send("Internal error");
+    }
   }
-  if (sessionId) sessionLastActivity.set(sessionId, Date.now()); // 更新活動時間
-  await transport.handleRequest(req, res);
 });
 
 app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const transport = sessionId ? streamableTransports.get(sessionId) : undefined;
-  if (!transport) {
-    res.status(404).send("Session not found");
-    return;
-  }
-  await transport.handleRequest(req, res);
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const transport = sessionId ? streamableTransports.get(sessionId) : undefined;
+    if (!transport) {
+      res.status(404).send("Session not found");
+      return;
+    }
+    await transport.handleRequest(req, res);
 
-  // 驗證是否成功移除
-  if (sessionId) {
-    sessionLastActivity.delete(sessionId); // 清理活動記錄
-    if (!streamableTransports.has(sessionId)) {
-      console.log(`✅ Session ${sessionId} 已成功移除`);
-    } else {
-      console.log(`❌ Session ${sessionId} 未成功移除`);
+    if (sessionId) {
+      await closeSessionTransport(sessionId, "delete");
+      if (!streamableTransports.has(sessionId)) {
+        console.log(`✅ Session ${sessionId} 已成功移除`);
+      } else {
+        console.log(`❌ Session ${sessionId} 未成功移除`);
+      }
+    }
+  } catch (error: any) {
+    if (!isBenignStreamTermination(error)) {
+      console.error(`[MCP][DELETE] 失敗`, {
+        message: error?.message,
+        stack: error?.stack,
+      });
+    }
+    if (!res.headersSent) {
+      res.status(500).send("Internal error");
     }
   }
 });
