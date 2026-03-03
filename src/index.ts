@@ -58,8 +58,17 @@ function createMcpServer() {
     };
   };
 
-  const listAccessibleProjects = async (options?: { maxProjects?: number }) => {
+  const listAccessibleProjects = async (options?: { maxProjects?: number; projectId?: string }) => {
     const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+
+    if (options?.projectId) {
+      const encodedProjectId = encodeURIComponent(options.projectId);
+      const response = await axios.get(`${GITLAB_API}/projects/${encodedProjectId}`, {
+        headers,
+      });
+      return [response.data];
+    }
+
     const { url, baseParams } = getProjectsEndpointConfig();
     const perPage = 100;
     const allProjects: Array<any> = [];
@@ -130,6 +139,7 @@ function createMcpServer() {
     keywords: string[],
     options?: {
       scanMode?: "fast" | "balanced" | "deep";
+      projectId?: string;
       maxProjects?: number;
       maxFilesReadPerProject?: number;
       maxMatchedResults?: number;
@@ -152,7 +162,10 @@ function createMcpServer() {
     const readConcurrency = defaults.readConcurrency;
     const treeCacheTtlMs = defaults.treeCacheTtlMs;
 
-    const projects = await listAccessibleProjects({ maxProjects });
+    const projects = await listAccessibleProjects({
+      maxProjects,
+      ...(options?.projectId ? { projectId: options.projectId } : {}),
+    });
     const projectsToScan = projects.slice(0, maxProjects);
     const allowedExtensions = [
       ".php", ".ts", ".js", ".vue", ".json", ".yml", ".yaml", ".xml",
@@ -295,6 +308,7 @@ function createMcpServer() {
     perPage: number,
     options?: {
       scanMode?: "fast" | "balanced" | "deep";
+      projectId?: string;
       maxProjects?: number;
       maxFilesReadPerProject?: number;
       maxMatchedResults?: number;
@@ -305,7 +319,13 @@ function createMcpServer() {
     const keywords = splitKeywords(query);
     const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [];
 
-    if (PLATFORM_GROUP_ID) {
+    if (options?.projectId) {
+      attempts.push({
+        name: "project-search-endpoint",
+        url: `${GITLAB_API}/projects/${encodeURIComponent(options.projectId)}/search`,
+        params: { scope, search: keywords[0] || query, per_page: perPage },
+      });
+    } else if (PLATFORM_GROUP_ID) {
       attempts.push({
         name: "group-search-endpoint",
         url: `${GITLAB_API}/groups/${PLATFORM_GROUP_ID}/search`,
@@ -486,25 +506,41 @@ function createMcpServer() {
     "在可存取範圍內搜尋程式碼或檔案內容。💡 有設定 PLATFORM_GROUP_ID 時限定該群組；未設定時以 token 可存取範圍搜尋。", 
     {
       query: z.string().describe("搜尋關鍵字，例如：臺銀、esunbank、PaymentService、virtual_account"),
+      projectId: z.string().optional().describe("指定單一專案 ID 或路徑（如 12345 或 platform/tc-gaizan），可大幅加速搜尋"),
       scope: z.enum(["blobs", "wiki_blobs"]).optional().describe("搜尋範圍（預設 blobs = 程式碼檔案）"),
       mode: z.enum(["fast", "balanced", "deep", "hybrid"]).optional().describe("掃描模式：fast（較快）、balanced（預設）、deep（較完整）、hybrid（先快後深）"),
       maxProjects: z.number().int().min(1).max(200).optional().describe("最多掃描專案數（覆蓋模式預設值）"),
       maxFilesPerProject: z.number().int().min(1).max(200).optional().describe("每個專案最多讀取檔案數（覆蓋模式預設值）"),
       maxResults: z.number().int().min(1).max(500).optional().describe("最多回傳命中結果數（覆蓋模式預設值）"),
     }, 
-    async ({ query, scope = "blobs", mode = "balanced", maxProjects, maxFilesPerProject, maxResults }) => {
-    console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}, 模式：${mode}）`);
+    async ({ query, projectId, scope = "blobs", mode = "balanced", maxProjects, maxFilesPerProject, maxResults }) => {
+    console.log(`[search_code] 搜尋關鍵字 "${query}"（範圍：${scope}, 模式：${mode}${projectId ? `, 專案：${projectId}` : ""}）`);
     
     try {
+      const DEFAULT_UNSCOPED_MAX_PROJECTS = 10;
+      const effectiveMaxProjects = typeof maxProjects === "number"
+        ? maxProjects
+        : (!projectId ? DEFAULT_UNSCOPED_MAX_PROJECTS : undefined);
+      const shouldWarnUnscoped = !projectId;
+
+      if (shouldWarnUnscoped && typeof maxProjects !== "number") {
+        console.warn(`[search_code] 未指定 projectId，套用預設 maxProjects=${DEFAULT_UNSCOPED_MAX_PROJECTS} 以避免慢查詢`);
+      }
+
       const searchOptions: {
         scanMode?: "fast" | "balanced" | "deep";
+        projectId?: string;
         maxProjects?: number;
         maxFilesReadPerProject?: number;
         maxMatchedResults?: number;
       } = { scanMode: mode === "hybrid" ? "fast" : mode };
 
-      if (typeof maxProjects === "number") {
-        searchOptions.maxProjects = maxProjects;
+      if (projectId) {
+        searchOptions.projectId = projectId;
+      }
+
+      if (typeof effectiveMaxProjects === "number") {
+        searchOptions.maxProjects = effectiveMaxProjects;
       }
       if (typeof maxFilesPerProject === "number") {
         searchOptions.maxFilesReadPerProject = maxFilesPerProject;
@@ -522,13 +558,18 @@ function createMcpServer() {
         if (shouldBackfill) {
           const deepOptions: {
             scanMode: "deep";
+            projectId?: string;
             maxProjects?: number;
             maxFilesReadPerProject?: number;
             maxMatchedResults?: number;
           } = { scanMode: "deep" };
 
-          if (typeof maxProjects === "number") {
-            deepOptions.maxProjects = maxProjects;
+          if (projectId) {
+            deepOptions.projectId = projectId;
+          }
+
+          if (typeof effectiveMaxProjects === "number") {
+            deepOptions.maxProjects = effectiveMaxProjects;
           }
           if (typeof maxFilesPerProject === "number") {
             deepOptions.maxFilesReadPerProject = maxFilesPerProject;
@@ -550,10 +591,13 @@ function createMcpServer() {
       console.log(`[search_code] 找到 ${results.length} 筆結果，策略：${strategy}`);
       
       if (results.length === 0) {
+        const warningText = shouldWarnUnscoped
+          ? `⚠️ 未指定 projectId，這次查詢已限制最多掃描 ${effectiveMaxProjects} 個專案以降低延遲。若要更快且更完整，建議指定 projectId。\n\n`
+          : "";
         return {
           content: [{
             type: "text",
-            text: `未找到包含 "${query}" 的程式碼\n\n💡 建議下一步操作：\n1. 嘗試使用相關的英文關鍵字（如 "payment", "virtual", "bank"）\n2. 使用 search_projects_by_file 搜尋特定檔案\n3. 使用 list_platform_projects 查看所有可用專案\n4. 確認關鍵字拼寫是否正確`,
+            text: `${warningText}未找到包含 "${query}" 的程式碼\n\n💡 建議下一步操作：\n1. 嘗試使用相關的英文關鍵字（如 "payment", "virtual", "bank"）\n2. 使用 search_projects_by_file 搜尋特定檔案\n3. 使用 list_platform_projects 查看所有可用專案\n4. 確認關鍵字拼寫是否正確`,
           }],
         };
       }
@@ -568,7 +612,11 @@ function createMcpServer() {
         groupedResults.get(projectName)!.push(result);
       }
       
-      let output = `找到 ${results.length} 筆包含 "${query}" 的程式碼（策略：${strategy}）：\n\n`;
+      let output = "";
+      if (shouldWarnUnscoped) {
+        output += `⚠️ 未指定 projectId，本次最多掃描 ${effectiveMaxProjects} 個專案（可用 maxProjects 覆蓋）。建議指定 projectId 以顯著加速。\n\n`;
+      }
+      output += `找到 ${results.length} 筆包含 "${query}" 的程式碼（策略：${strategy}${projectId ? `，專案：${projectId}` : ""}）：\n\n`;
       
       for (const [projectName, items] of groupedResults.entries()) {
         output += `## ${projectName} (${items.length} 筆)\n\n`;

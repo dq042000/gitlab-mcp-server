@@ -71,11 +71,29 @@ MCP 連線模式與常見錯誤
 	- `balanced`：預設（速度與完整度平衡）
 	- `deep`：較完整（掃描範圍較大）
 	- `hybrid`：先 `fast` 再 `deep` 補抓（建議查漏時使用）
+- **強烈建議指定 `projectId`**（專案 ID 或 `group/project` 路徑）：
+	- 會優先使用 GitLab `projects/:id/search`，速度通常明顯快於群組或全域搜尋
+	- fallback 內容掃描也只會掃該專案，避免掃到整個可存取範圍
+- 若 **未指定 `projectId`** 且未傳入 `maxProjects`：
+	- 系統會自動套用 `maxProjects=10` 保護值，降低慢查詢風險
+	- 回應會提示目前為未指定專案的受限搜尋
 - 可選參數：
+	- `projectId`：指定單一專案（建議優先使用）
 	- `maxProjects`：最多掃描專案數
 	- `maxFilesPerProject`：每個專案最多讀取檔案數
 	- `maxResults`：最多回傳結果數
 - 多關鍵字請用 `|` 分隔，例如：`臺銀|台銀|繳費|virtual_account|bank_code`
+
+範例：
+
+```json
+{
+  "query": "PaymentService|virtual_account",
+  "projectId": "platform/tc-gaizan",
+  "mode": "fast",
+  "maxResults": 50
+}
+```
 
 GitLab Token 權限建議（`GITLAB_GROUP_TOKEN`）
 
