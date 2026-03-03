@@ -25,7 +25,13 @@ type CachedTreeEntry = {
   items: Array<any>;
 };
 
+type CachedProjectResolveEntry = {
+  expiresAt: number;
+  project: any;
+};
+
 const projectTreeCache = new Map<string, CachedTreeEntry>();
+const projectResolveCache = new Map<string, CachedProjectResolveEntry>();
 
 // --- 每次連線建立一個新的 McpServer 實例，避免 "Already connected to a transport" 錯誤 ---
 function createMcpServer() {
@@ -58,15 +64,82 @@ function createMcpServer() {
     };
   };
 
+  const resolveProjectIdentifier = async (projectInput: string) => {
+    const normalizedInput = projectInput.trim();
+    const cacheKey = normalizedInput.toLowerCase();
+    const now = Date.now();
+    const cached = projectResolveCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.project;
+    }
+
+    const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
+    const encodedInput = encodeURIComponent(normalizedInput);
+
+    try {
+      const directResponse = await axios.get(`${GITLAB_API}/projects/${encodedInput}`, { headers });
+      projectResolveCache.set(cacheKey, {
+        expiresAt: now + 10 * 60 * 1000,
+        project: directResponse.data,
+      });
+      return directResponse.data;
+    } catch (directError: any) {
+      const status = directError.response?.status;
+      if (status !== 404) {
+        throw directError;
+      }
+    }
+
+    const { url, baseParams } = getProjectsEndpointConfig();
+    const searchToken = normalizedInput.includes("/")
+      ? normalizedInput.split("/").pop() || normalizedInput
+      : normalizedInput;
+
+    const searchResponse = await axios.get(url, {
+      headers,
+      params: {
+        ...baseParams,
+        search: searchToken,
+        per_page: 100,
+        page: 1,
+      },
+    });
+
+    const candidates = Array.isArray(searchResponse.data) ? searchResponse.data : [];
+    const loweredInput = normalizedInput.toLowerCase();
+    const matched = candidates.find((project: any) => {
+      const idText = String(project?.id || "").toLowerCase();
+      const name = String(project?.name || "").toLowerCase();
+      const path = String(project?.path || "").toLowerCase();
+      const namespacePath = String(project?.path_with_namespace || "").toLowerCase();
+
+      return (
+        idText === loweredInput ||
+        name === loweredInput ||
+        path === loweredInput ||
+        namespacePath === loweredInput ||
+        namespacePath.endsWith(`/${loweredInput}`)
+      );
+    });
+
+    if (!matched) {
+      throw new Error(`找不到專案：${projectInput}。請提供專案 ID 或完整路徑（例如 platform/tc-gaizan）`);
+    }
+
+    projectResolveCache.set(cacheKey, {
+      expiresAt: now + 10 * 60 * 1000,
+      project: matched,
+    });
+
+    return matched;
+  };
+
   const listAccessibleProjects = async (options?: { maxProjects?: number; projectId?: string }) => {
     const headers = { "PRIVATE-TOKEN": GROUP_TOKEN };
 
     if (options?.projectId) {
-      const encodedProjectId = encodeURIComponent(options.projectId);
-      const response = await axios.get(`${GITLAB_API}/projects/${encodedProjectId}`, {
-        headers,
-      });
-      return [response.data];
+      const resolvedProject = await resolveProjectIdentifier(options.projectId);
+      return [resolvedProject];
     }
 
     const { url, baseParams } = getProjectsEndpointConfig();
@@ -318,11 +391,18 @@ function createMcpServer() {
     const diagnostics: string[] = [];
     const keywords = splitKeywords(query);
     const attempts: Array<{ name: string; url: string; params: Record<string, string | number> }> = [];
+    let scopedProjectId = options?.projectId;
 
-    if (options?.projectId) {
+    if (scopedProjectId) {
+      const resolvedProject = await resolveProjectIdentifier(scopedProjectId);
+      scopedProjectId = String(resolvedProject.id);
+      diagnostics.push(`project-resolved: ${scopedProjectId} (${resolvedProject.path_with_namespace || resolvedProject.name})`);
+    }
+
+    if (scopedProjectId) {
       attempts.push({
         name: "project-search-endpoint",
-        url: `${GITLAB_API}/projects/${encodeURIComponent(options.projectId)}/search`,
+        url: `${GITLAB_API}/projects/${encodeURIComponent(scopedProjectId)}/search`,
         params: { scope, search: keywords[0] || query, per_page: perPage },
       });
     } else if (PLATFORM_GROUP_ID) {
@@ -376,7 +456,10 @@ function createMcpServer() {
       console.log(`[searchCodeInGroup] 進入 fallback：逐專案掃描內容`, { query, keywords, scope });
       const scanResults = await manualScanSearchInGroup(
         keywords.length > 0 ? keywords : [query],
-        options,
+        {
+          ...options,
+          ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+        },
       );
       console.log(`[searchCodeInGroup] fallback 完成，結果 ${scanResults.length} 筆`);
       return {
@@ -894,13 +977,17 @@ function createMcpServer() {
     },
     async ({ projectId, featureName, keywords = [] }) => {
       console.log(`[analyze_feature] 分析功能實作`, { projectId, featureName, keywords });
-
-      const encodedProjectId = encodeURIComponent(projectId);
       const results: string[] = [];
 
       try {
+        const resolvedProject = await resolveProjectIdentifier(projectId);
+        const resolvedProjectId = String(resolvedProject.id);
+        const resolvedProjectPath = String(resolvedProject.path_with_namespace || resolvedProject.name || projectId);
+        const encodedProjectId = encodeURIComponent(resolvedProjectId);
+        const defaultBranch = resolvedProject.default_branch || "main";
+
         results.push(`# 功能分析：${featureName}`);
-        results.push(`專案：${projectId}\n`);
+        results.push(`專案：${resolvedProjectPath}（ID: ${resolvedProjectId}）\n`);
 
         // 步驟 1：從功能名稱推測關鍵字
         const autoKeywords = [
@@ -917,17 +1004,21 @@ function createMcpServer() {
         // 對每個關鍵字進行搜尋
         for (const keyword of autoKeywords.slice(0, 5)) {
           try {
-            const { results: searchResults } = await searchCodeInGroup(keyword, "blobs", 20);
+            const { results: searchResults } = await searchCodeInGroup(keyword, "blobs", 20, {
+              scanMode: "fast",
+              projectId: resolvedProjectId,
+              maxProjects: 1,
+              maxFilesReadPerProject: 30,
+              maxMatchedResults: 80,
+            });
 
             for (const result of searchResults) {
-              if (result.project_id?.toString() === projectId || result.project_id === parseInt(projectId)) {
-                relevantFiles.add(result.path || result.filename);
-                if (codeSnippets.length < 10) {
-                  codeSnippets.push({
-                    file: result.path || result.filename,
-                    content: result.data?.substring(0, 300) || ""
-                  });
-                }
+              relevantFiles.add(result.path || result.filename);
+              if (codeSnippets.length < 10) {
+                codeSnippets.push({
+                  file: result.path || result.filename,
+                  content: result.data?.substring(0, 300) || ""
+                });
               }
             }
           } catch (error: any) {
@@ -982,13 +1073,8 @@ function createMcpServer() {
           try {
             // 嘗試讀取檔案
             const encodedFilePath = encodeURIComponent(filePath);
-            
-            // 先取得專案預設分支
-            const projectUrl = `${GITLAB_API}/projects/${encodedProjectId}`;
-            const projectResponse = await axios.get(projectUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
-            const branch = projectResponse.data.default_branch || "main";
-            
-            const fileUrl = `${GITLAB_API}/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(branch)}`;
+
+            const fileUrl = `${GITLAB_API}/projects/${encodedProjectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(defaultBranch)}`;
             const fileResponse = await axios.get(fileUrl, { headers: { "PRIVATE-TOKEN": GROUP_TOKEN } });
             
             const content = String(fileResponse.data);
